@@ -88,6 +88,8 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
 
   PREFIX_KEY_NORMALIZE_CHARACTER = "_"
   PERIODIC_CHECK_INTERVAL_IN_SECONDS = 15
+  PERIODIC_SWEEPER_INTERVAL_IN_SECONDS = 60
+
   CRASH_RECOVERY_THREADPOOL = Concurrent::ThreadPoolExecutor.new({
                                                                    :min_threads => 1,
                                                                    :max_threads => 2,
@@ -114,7 +116,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
 
   # Set the time, in MINUTES, to close the current sub_time_section of bucket.
   # If you also define file_size you have a number of files related to the section and the current tag.
-  # If it's valued 0 and rotation_strategy is 'time' or 'size_and_time' then the plugin reaise a configuration error.
+  # If it's valued 0 and rotation_strategy is 'time' or 'size_and_time' then the plugin raise a configuration error.
   config :time_file, :validate => :number, :default => 15
 
   # If `restore => false` is specified and Logstash crashes, the unprocessed files are not sent into the bucket.
@@ -124,14 +126,14 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   config :restore, :validate => :boolean, :default => true
 
   # The S3 canned ACL to use when putting the file. Defaults to "private".
-  config :canned_acl, :validate => ["private", "public-read", "public-read-write", "authenticated-read", "aws-exec-read", "bucket-owner-read", "bucket-owner-full-control", "log-delivery-write"],
+  config :canned_acl, :validate => %w[private public-read public-read-write authenticated-read aws-exec-read bucket-owner-read bucket-owner-full-control log-delivery-write],
          :default => "private"
 
   # Specifies whether or not to use S3's server side encryption. Defaults to no encryption.
   config :server_side_encryption, :validate => :boolean, :default => false
 
   # Specifies what type of encryption to use when SSE is enabled.
-  config :server_side_encryption_algorithm, :validate => ["AES256", "aws:kms"], :default => "AES256"
+  config :server_side_encryption_algorithm, :validate => %w[AES256 aws:kms], :default => "AES256"
 
   # The key to use when specified along with server_side_encryption => aws:kms.
   # If server_side_encryption => aws:kms is set but this is not default KMS key is used.
@@ -142,7 +144,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   # More information about the different storage classes can be found:
   # http://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html
   # Defaults to STANDARD.
-  config :storage_class, :validate => ["STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA"], :default => "STANDARD"
+  config :storage_class, :validate => %w[STANDARD REDUCED_REDUNDANCY STANDARD_IA ONEZONE_IA], :default => "STANDARD"
 
   # Set the directory where logstash will store the tmp files before sending it to S3
   # default to the current OS temporary directory in linux /tmp/logstash
@@ -166,7 +168,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
 
   # The version of the S3 signature hash to use. Normally uses the internal client default, can be explicitly
   # specified here
-  config :signature_version, :validate => ['v2', 'v4']
+  config :signature_version, :validate => %w[v2 v4]
 
   # Define tags to be appended to the file on the S3 bucket.
   #
@@ -183,10 +185,10 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
 
   # Define the strategy to use to decide when we need to rotate the file and push it to S3,
   # The default strategy is to check for both size and time, the first one to match will rotate the file.
-  config :rotation_strategy, :validate => ["size_and_time", "size", "time"], :default => "size_and_time"
+  config :rotation_strategy, :validate => %w[size_and_time size time], :default => "size_and_time"
 
   # The common use case is to define permission on the root bucket and give Logstash full access to write its logs.
-  # In some circonstances you need finer grained permission on subfolder, this allow you to disable the check at startup.
+  # In some circumstances you need finer grained permission on subfolder, this allow you to disable the check at startup.
   config :validate_credentials_on_root_bucket, :validate => :boolean, :default => true
 
   # The number of times to retry a failed S3 upload.
@@ -235,6 +237,8 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     # If we need time based rotation we need to do periodic check on the file
     # to take care of file that were not updated recently
     start_periodic_check if @rotation.needs_periodic?
+
+    start_stale_sweeper
   end
 
   def multi_receive_encoded(events_and_encoded)
@@ -260,10 +264,9 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
 
   def close
     stop_periodic_check if @rotation.needs_periodic?
+    stop_stale_sweeper # stop stale sweeps
 
     @logger.debug("Uploading current workspace")
-
-    @file_repository.shutdown # stop stale sweeps
 
     # The plugin has stopped receiving new events, but we still have
     # data on disk, lets make sure it get to S3.
@@ -324,7 +327,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     @logger.debug("Start periodic rotation check")
 
     @periodic_check = Concurrent::TimerTask.new(:execution_interval => PERIODIC_CHECK_INTERVAL_IN_SECONDS) do
-      @logger.debug("Periodic check for stale files")
+      @logger.debug("Periodic check for file rotation")
 
       rotate_if_needed(@file_repository.keys)
     end
@@ -332,8 +335,25 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     @periodic_check.execute
   end
 
+  def start_stale_sweeper
+    @stale_sweeper = Concurrent::TimerTask.new(:execution_interval => PERIODIC_SWEEPER_INTERVAL_IN_SECONDS) do
+      LogStash::Util.set_thread_name("S3, Stale factory sweeper")
+
+      @logger.debug("Steal sweeper check started.")
+      @file_repository.keys.each do | prefix_key |
+        @file_repository.remove_if_stale(prefix_key)
+      end
+    end
+
+    @stale_sweeper.execute
+    end
+
   def stop_periodic_check
     @periodic_check.shutdown
+  end
+
+  def stop_stale_sweeper
+    @stale_sweeper.shutdown
   end
 
   def bucket_resource
@@ -370,6 +390,9 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
       @uploader.upload_async(temp_file,
                              :on_complete => method(:clean_temporary_file),
                              :upload_options => upload_options )
+    else
+      # clean up rotated bu never written files
+      clean_temporary_file(temp_file)
     end
   end
 

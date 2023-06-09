@@ -10,8 +10,9 @@ module LogStash
   module Outputs
     class S3
       class FileRepository
-        DEFAULT_STATE_SWEEPER_INTERVAL_SECS = 60
-        DEFAULT_STALE_TIME_SECS = 15 * 60
+
+        TEMP_FILE_STALE_TIME_SECS = 15 * 60
+
         # Ensure that all access or work done
         # on a factory is threadsafe
         class PrefixedValue
@@ -63,17 +64,11 @@ module LogStash
         end
 
         def initialize(tags, encoding, temporary_directory,
-                       stale_time = DEFAULT_STALE_TIME_SECS,
-                       sweeper_interval = DEFAULT_STATE_SWEEPER_INTERVAL_SECS)
+                       stale_time = TEMP_FILE_STALE_TIME_SECS)
           # The path need to contains the prefix so when we start
-          # logtash after a crash we keep the remote structure
+          # Logstash after a crash we keep the remote structure
           @prefixed_factories =  ConcurrentHashMap.new
-
-          @sweeper_interval = sweeper_interval
-
           @factory_initializer = FactoryInitializer.new(tags, encoding, temporary_directory, stale_time)
-
-          start_stale_sweeper
         end
 
         def keys
@@ -146,10 +141,6 @@ module LogStash
           nil # void return avoid leaking unsynchronized access
         end
 
-        def shutdown
-          stop_stale_sweeper
-        end
-
         def size
           @prefixed_factories.size
         end
@@ -170,22 +161,6 @@ module LogStash
               end
             end
           end
-        end
-
-        def start_stale_sweeper
-          @stale_sweeper = Concurrent::TimerTask.new(:execution_interval => @sweeper_interval) do
-            LogStash::Util.set_thread_name("S3, Stale factory sweeper")
-
-            @prefixed_factories.keys.each do |prefix|
-              remove_if_stale(prefix)
-            end
-          end
-
-          @stale_sweeper.execute
-        end
-
-        def stop_stale_sweeper
-          @stale_sweeper.shutdown
         end
       end
     end
