@@ -1,3 +1,6 @@
+## 7.3.3
+  - Fix: timestamp precision mismatch causing S3 input to skip backup and delete operations [#60](https://github.com/logstash-plugins/logstash-integration-aws/pull/60)
+
 ## 7.3.2
   - Fix: replace deprecated `File.exists?` with `File.exist?` for Ruby 3.4 (JRuby 10) compatibility [#65](https://github.com/logstash-plugins/logstash-integration-aws/pull/65)
 
